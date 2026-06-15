@@ -1,0 +1,67 @@
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Write path — scale independently: docker compose up --scale shortener=N
+  shortener:
+    build: .
+    restart: unless-stopped
+    environment:
+      APP_MODE: shortener
+      PORT: "8080"
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB: urlshortener
+      REDIS_ADDR: redis:6379
+      DEFAULT_TTL_DAYS: "${DEFAULT_TTL_DAYS:-30}"
+      BLOOM_CAPACITY: "${BLOOM_CAPACITY:-10000000}"
+      BLOOM_FP_RATE: "${BLOOM_FP_RATE:-0.001}"
+    ports:
+      - "8080:8080"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Read path — scale independently: docker compose up --scale redirector=N
+  redirector:
+    build: .
+    restart: unless-stopped
+    environment:
+      APP_MODE: redirector
+      PORT: "8080"
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB: urlshortener
+      REDIS_ADDR: redis:6379
+      DEFAULT_TTL_DAYS: "${DEFAULT_TTL_DAYS:-30}"
+    ports:
+      - "8081:8080"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  mongo_data:
