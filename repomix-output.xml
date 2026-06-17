@@ -1,0 +1,1945 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+.claude/settings.local.json
+.dockerignore
+.env.example
+.gitignore
+cmd/server/main.go
+docker-compose.yml
+Dockerfile
+go.mod
+internal/config/config.go
+internal/handler/handler.go
+internal/handler/redirect.go
+internal/handler/router.go
+internal/handler/shorten.go
+internal/model/url.go
+internal/service/mocks_test.go
+internal/service/redirector_test.go
+internal/service/redirector.go
+internal/service/service.go
+internal/service/shortener_test.go
+internal/service/shortener.go
+internal/store/mongo.go
+internal/store/redis.go
+internal/store/repository.go
+internal/util/base62_test.go
+internal/util/base62.go
+internal/util/bloom.go
+internal/util/hash.go
+README.md
+stress_test/stress_test.js
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path=".claude/settings.local.json">
+{
+  "permissions": {
+    "allow": [
+      "Bash(go mod *)",
+      "PowerShell($k6 = Get-Command k6 -ErrorAction SilentlyContinue; if \\($k6\\) { \"INSTALLED: $\\($k6.Source\\)\"; k6 version } else { \"NOT INSTALLED\" })"
+    ]
+  }
+}
+</file>
+
+<file path="stress_test/stress_test.js">
+import http from 'k6/http';
+import { check, sleep, fail } from 'k6';
+import { randomString } from 'https://jslib.k6.io/k6-utils/1.2.0/index.js';
+
+export const options = {
+  stages: [
+    { duration: '1m', target: 500 },  // Tăng tải lên 500 VUs
+    { duration: '3m', target: 1000 }, // Chạy ổn định ở 1000 VUs
+    { duration: '1m', target: 2000 }, // Đẩy lên đỉnh 2000 VUs
+    { duration: '1m', target: 0 },   // Giảm tải về 0
+  ],
+  thresholds: {
+    // Chỉ cảnh báo nếu tỷ lệ lỗi thực sự (5xx hoặc lỗi kết nối) vượt quá 1%
+    http_req_failed: ['rate<0.01'],
+    'http_req_duration': ['p(95)<100'],
+  },
+};
+
+const WRITE_URL = 'http://localhost:8080/api/v1/shorten';
+const READ_BASE = 'http://localhost:8081';
+
+// --- Cấu hình kịch bản (có thể override qua biến môi trường __ENV) ---
+// Kích thước pool key thật được tạo trong setup().
+const POOL_SIZE = Number(__ENV.POOL_SIZE) || 1000;
+// Tỷ lệ key "nóng" (hot) trong pool — phần này nhận phần lớn lưu lượng đọc
+// để mô phỏng phân phối truy cập thực tế và đẩy cache hit ratio lên cao.
+const HOT_FRACTION = Number(__ENV.HOT_FRACTION) || 0.10;
+
+// Tỷ lệ WRITE / READ trên tổng lưu lượng.
+const WRITE_RATIO = Number(__ENV.WRITE_RATIO) || 0.10;
+
+// Phân phối nội bộ của luồng READ (tổng = 1.0):
+//   HOT  -> đọc key nóng       => gần như luôn cache hit
+//   COLD -> đọc key còn lại     => cache hit sau lần chạm đầu (lazy repopulate)
+//   MISS -> key ngẫu nhiên 7 ký tự => cache miss + 404 thật
+const READ_HOT = Number(__ENV.READ_HOT) || 0.80;
+const READ_COLD = Number(__ENV.READ_COLD) || 0.15;
+// READ_MISS = phần còn lại (~0.05)
+
+// setup() chạy MỘT LẦN trước khi load test bắt đầu. Giá trị trả về được k6
+// truyền (read-only) vào hàm default của MỌI VU — đây là cách chuẩn để chia sẻ
+// trạng thái bất biến giữa các VU (VU không chia sẻ được biến runtime với nhau).
+export function setup() {
+  const keys = [];
+  const params = {
+    headers: { 'Content-Type': 'application/json' },
+    tags: { name: 'Setup_Seed' },
+  };
+
+  for (let i = 0; i < POOL_SIZE; i++) {
+    const payload = JSON.stringify({
+      long_url: `https://example.com/seed/${i}/${randomString(10)}`,
+    });
+    const res = http.post(WRITE_URL, payload, params);
+    if (res.status === 201) {
+      try {
+        const key = JSON.parse(res.body).short_url;
+        if (key) {
+          keys.push(key);
+        }
+      } catch (e) {
+        // Bỏ qua response không parse được; sẽ kiểm tra tổng số ở dưới.
+      }
+    }
+  }
+
+  if (keys.length === 0) {
+    fail(
+      `setup() không tạo được key nào (POOL_SIZE=${POOL_SIZE}). ` +
+      `Kiểm tra service WRITE tại ${WRITE_URL} đã chạy chưa.`
+    );
+  }
+
+  console.log(`setup(): đã tạo pool gồm ${keys.length}/${POOL_SIZE} key thật.`);
+  return { keys };
+}
+
+export default function (data) {
+  const keys = data.keys;
+  // Ranh giới giữa tập key nóng (đầu mảng) và phần còn lại.
+  const hotCount = Math.max(1, Math.floor(keys.length * HOT_FRACTION));
+
+  if (Math.random() < WRITE_RATIO) {
+    // --- LUỒNG WRITE ---
+    const payload = JSON.stringify({
+      long_url: `https://example.com/path/${randomString(10)}`,
+    });
+
+    const params = {
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      // Sử dụng thẻ 'tags' với thuộc tính 'name' để k6 gộp nhóm toàn bộ request WRITE
+      // tránh sinh ra hàng nghìn metric riêng lẻ gây cảnh báo tốn bộ nhớ RAM.
+      tags: { name: 'Write_Shorten' },
+    };
+
+    const res = http.post(WRITE_URL, payload, params);
+    check(res, {
+      'write status is 201': (r) => r.status === 201,
+      'has short_url': (r) => {
+        try {
+          return JSON.parse(r.body).short_url !== undefined;
+        } catch (e) {
+          return false;
+        }
+      },
+    });
+  } else {
+    // --- LUỒNG READ (phân phối hot/cold/miss) ---
+    const roll = Math.random();
+    let shortKey;
+
+    if (roll < READ_HOT) {
+      // Key nóng: chọn ngẫu nhiên trong tập hot => cache hit gần như chắc chắn.
+      shortKey = keys[Math.floor(Math.random() * hotCount)];
+    } else if (roll < READ_HOT + READ_COLD) {
+      // Key nguội: chọn trong phần còn lại của pool (key thật, đã tồn tại trong DB).
+      const coldRange = keys.length - hotCount;
+      const idx = coldRange > 0
+        ? hotCount + Math.floor(Math.random() * coldRange)
+        : Math.floor(Math.random() * keys.length);
+      shortKey = keys[idx];
+    } else {
+      // Cache miss thật: key ngẫu nhiên 7 ký tự gần như chắc chắn không tồn tại.
+      shortKey = randomString(7);
+    }
+
+    const params = {
+      redirects: 0,
+      tags: { name: 'Read_Redirect' }, // Gộp toàn bộ request READ vào một nhóm metric chung
+    };
+
+    const res = http.get(`${READ_BASE}/${shortKey}`, params);
+
+    // Ghi đè chỉ định nghĩa lỗi của k6 cho request này:
+    // Chỉ coi là thất bại nếu status từ 500 trở lên hoặc bằng 0 (lỗi mạng)
+    res.status >= 500 || res.status === 0 ? res.error = 'Server Error' : null;
+
+    check(res, {
+      'read status is 302 or 404': (r) => r.status === 302 || r.status === 404,
+    });
+  }
+
+  sleep(0.1);
+}
+</file>
+
+<file path=".dockerignore">
+.git
+.gitignore
+.env
+*.md
+Dockerfile
+docker-compose.yml
+*.exe
+*.test
+coverage.*
+</file>
+
+<file path=".env.example">
+# Application mode: shortener | redirector | all
+APP_MODE=all
+
+# HTTP port the server listens on inside the container
+PORT=8080
+
+# MongoDB
+MONGO_URI=mongodb://localhost:27017
+MONGO_DB=urlshortener
+
+# Redis
+REDIS_ADDR=localhost:6379
+REDIS_PASSWORD=
+REDIS_DB=0
+
+# Expiration applied to every newly created short URL
+DEFAULT_TTL_DAYS=30
+
+# In-memory Bloom filter sizing (shortener/all mode only)
+BLOOM_CAPACITY=10000000
+BLOOM_FP_RATE=0.001
+</file>
+
+<file path=".gitignore">
+# If you prefer the allow list template instead of the deny list, see community template:
+# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
+#
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Code coverage profiles and other test artifacts
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+
+# Editor/IDE
+# .idea/
+# .vscode/
+</file>
+
+<file path="cmd/server/main.go">
+// Command server runs the URL shortener in shortener, redirector, or all mode,
+// selected via the APP_MODE environment variable.
+package main
+
+import (
+	"context"
+	"errors"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/toainguyen/url-shortener/internal/config"
+	"github.com/toainguyen/url-shortener/internal/handler"
+	"github.com/toainguyen/url-shortener/internal/service"
+	"github.com/toainguyen/url-shortener/internal/store"
+	"github.com/toainguyen/url-shortener/internal/util"
+)
+
+func main() {
+	if err := run(); err != nil {
+		log.Fatalf("fatal: %v", err)
+	}
+}
+
+func run() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	logger := log.New(os.Stdout, "[url-shortener] ", log.LstdFlags|log.LUTC)
+	logger.Printf("starting in mode=%s port=%s ttl_days=%d", cfg.AppMode, cfg.Port, cfg.DefaultTTLDays)
+
+	// Bounded context for all startup I/O.
+	initCtx, cancelInit := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelInit()
+
+	mongoClient, err := store.NewMongo(initCtx, cfg.MongoURI)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), store.DisconnectTimeout)
+		defer cancel()
+		_ = mongoClient.Disconnect(ctx)
+	}()
+
+	coll := store.URLCollection(mongoClient, cfg.MongoDB)
+	if err := store.EnsureIndexes(initCtx, coll); err != nil {
+		return err
+	}
+
+	cache, err := store.NewRedis(initCtx, cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = cache.Close() }()
+
+	repo := store.NewMongoRepository(coll)
+
+	var (
+		shortenHandler  *handler.ShortenHandler
+		redirectHandler *handler.RedirectHandler
+	)
+
+	if cfg.AppMode == config.ModeShortener || cfg.AppMode == config.ModeAll {
+		bloom := util.NewBloomFilter(cfg.BloomCapacity, cfg.BloomFPRate)
+		if err := bloom.Warm(initCtx, coll); err != nil {
+			return err
+		}
+		logger.Printf("bloom filter warmed (capacity=%d fp=%g)", cfg.BloomCapacity, cfg.BloomFPRate)
+		shortener := service.NewShortener(repo, cache, bloom, cfg.DefaultTTLDays)
+		shortenHandler = handler.NewShortenHandler(shortener)
+	}
+
+	if cfg.AppMode == config.ModeRedirector || cfg.AppMode == config.ModeAll {
+		redirector := service.NewRedirector(repo, cache)
+		redirectHandler = handler.NewRedirectHandler(redirector)
+	}
+
+	srv := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           handler.Router(cfg.AppMode, shortenHandler, redirectHandler),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	// Graceful shutdown on SIGINT/SIGTERM.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		logger.Printf("listening on %s", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+	}()
+
+	select {
+	case err := <-serverErr:
+		return err
+	case <-ctx.Done():
+		logger.Printf("shutdown signal received")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		return err
+	}
+	logger.Printf("stopped cleanly")
+	return nil
+}
+</file>
+
+<file path="docker-compose.yml">
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Write path — scale independently: docker compose up --scale shortener=N
+  shortener:
+    build: .
+    restart: unless-stopped
+    environment:
+      APP_MODE: shortener
+      PORT: "8080"
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB: urlshortener
+      REDIS_ADDR: redis:6379
+      DEFAULT_TTL_DAYS: "${DEFAULT_TTL_DAYS:-30}"
+      BLOOM_CAPACITY: "${BLOOM_CAPACITY:-10000000}"
+      BLOOM_FP_RATE: "${BLOOM_FP_RATE:-0.001}"
+    ports:
+      - "8080:8080"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Read path — scale independently: docker compose up --scale redirector=N
+  redirector:
+    build: .
+    restart: unless-stopped
+    environment:
+      APP_MODE: redirector
+      PORT: "8080"
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB: urlshortener
+      REDIS_ADDR: redis:6379
+      DEFAULT_TTL_DAYS: "${DEFAULT_TTL_DAYS:-30}"
+    ports:
+      - "8081:8080"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  mongo_data:
+</file>
+
+<file path="Dockerfile">
+# syntax=docker/dockerfile:1
+
+# ---- Build stage ----
+FROM golang:1.26 AS builder
+WORKDIR /src
+
+# Cache module downloads.
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+# Static, stripped binary for a minimal runtime image.
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server
+
+# ---- Runtime stage ----
+FROM gcr.io/distroless/static-debian12:nonroot
+WORKDIR /app
+COPY --from=builder /out/server /app/server
+
+# APP_MODE and PORT are supplied per-container by docker-compose.
+EXPOSE 8080
+USER nonroot:nonroot
+ENTRYPOINT ["/app/server"]
+</file>
+
+<file path="go.mod">
+module github.com/toainguyen/url-shortener
+
+go 1.25.0
+
+require (
+	github.com/bits-and-blooms/bloom/v3 v3.7.1
+	github.com/go-chi/chi/v5 v5.3.0
+	github.com/redis/go-redis/v9 v9.20.1
+	go.mongodb.org/mongo-driver v1.17.9
+)
+
+require (
+	github.com/bits-and-blooms/bitset v1.24.2 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/golang/snappy v0.0.4 // indirect
+	github.com/klauspost/compress v1.16.7 // indirect
+	github.com/montanaflynn/stats v0.7.1 // indirect
+	github.com/xdg-go/pbkdf2 v1.0.0 // indirect
+	github.com/xdg-go/scram v1.1.2 // indirect
+	github.com/xdg-go/stringprep v1.0.4 // indirect
+	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
+	go.uber.org/atomic v1.11.0 // indirect
+	golang.org/x/crypto v0.26.0 // indirect
+	golang.org/x/sync v0.8.0 // indirect
+	golang.org/x/text v0.17.0 // indirect
+)
+</file>
+
+<file path="internal/config/config.go">
+// Package config loads runtime configuration from environment variables.
+package config
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+)
+
+// AppMode selects which HTTP surface the binary exposes.
+type AppMode string
+
+const (
+	// ModeShortener exposes only the write path (POST /api/v1/shorten).
+	ModeShortener AppMode = "shortener"
+	// ModeRedirector exposes only the read path (GET /{short_url}).
+	ModeRedirector AppMode = "redirector"
+	// ModeAll exposes both surfaces; convenient for local development.
+	ModeAll AppMode = "all"
+)
+
+// Config holds all tunable settings for a running instance.
+type Config struct {
+	AppMode       AppMode
+	Port          string
+	MongoURI      string
+	MongoDB       string
+	RedisAddr     string
+	RedisPassword string
+	RedisDB       int
+
+	// DefaultTTLDays is applied to every newly created short URL.
+	DefaultTTLDays int
+
+	// Bloom filter sizing (shortener/all mode only).
+	BloomCapacity uint
+	BloomFPRate   float64
+}
+
+// Load reads configuration from the environment, applying sane defaults.
+// It returns an error only when a supplied value is malformed.
+func Load() (*Config, error) {
+	cfg := &Config{
+		AppMode:       AppMode(getEnv("APP_MODE", string(ModeAll))),
+		Port:          getEnv("PORT", "8080"),
+		MongoURI:      getEnv("MONGO_URI", "mongodb://localhost:27017"),
+		MongoDB:       getEnv("MONGO_DB", "urlshortener"),
+		RedisAddr:     getEnv("REDIS_ADDR", "localhost:6379"),
+		RedisPassword: getEnv("REDIS_PASSWORD", ""),
+	}
+
+	switch cfg.AppMode {
+	case ModeShortener, ModeRedirector, ModeAll:
+	default:
+		return nil, fmt.Errorf("invalid APP_MODE %q (want shortener|redirector|all)", cfg.AppMode)
+	}
+
+	var err error
+	if cfg.RedisDB, err = getEnvInt("REDIS_DB", 0); err != nil {
+		return nil, err
+	}
+	if cfg.DefaultTTLDays, err = getEnvInt("DEFAULT_TTL_DAYS", 30); err != nil {
+		return nil, err
+	}
+	if cfg.DefaultTTLDays <= 0 {
+		return nil, fmt.Errorf("DEFAULT_TTL_DAYS must be positive, got %d", cfg.DefaultTTLDays)
+	}
+
+	capacity, err := getEnvInt("BLOOM_CAPACITY", 10_000_000)
+	if err != nil {
+		return nil, err
+	}
+	cfg.BloomCapacity = uint(capacity)
+
+	if cfg.BloomFPRate, err = getEnvFloat("BLOOM_FP_RATE", 0.001); err != nil {
+		return nil, err
+	}
+
+	return cfg, nil
+}
+
+func getEnv(key, fallback string) string {
+	if v, ok := os.LookupEnv(key); ok && strings.TrimSpace(v) != "" {
+		return v
+	}
+	return fallback
+}
+
+func getEnvInt(key string, fallback int) (int, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		return fallback, nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil {
+		return 0, fmt.Errorf("env %s: %w", key, err)
+	}
+	return n, nil
+}
+
+func getEnvFloat(key string, fallback float64) (float64, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		return fallback, nil
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+	if err != nil {
+		return 0, fmt.Errorf("env %s: %w", key, err)
+	}
+	return f, nil
+}
+</file>
+
+<file path="internal/handler/handler.go">
+// Package handler exposes the HTTP surface for the shortener and redirector.
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+
+	"github.com/toainguyen/url-shortener/internal/model"
+)
+
+// ShortenService is the write-path dependency of the shorten handler.
+type ShortenService interface {
+	Create(ctx context.Context, longURL string) (*model.URL, error)
+}
+
+// RedirectService is the read-path dependency of the redirect handler.
+type RedirectService interface {
+	Resolve(ctx context.Context, shortURL string) (string, error)
+}
+
+// errorResponse is the JSON body returned for error statuses.
+type errorResponse struct {
+	Error string `json:"error"`
+}
+
+func writeJSON(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, errorResponse{Error: msg})
+}
+</file>
+
+<file path="internal/handler/redirect.go">
+package handler
+
+import (
+	"errors"
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/toainguyen/url-shortener/internal/model"
+	"github.com/toainguyen/url-shortener/internal/service"
+)
+
+// RedirectHandler serves GET /{short_url}.
+type RedirectHandler struct {
+	svc RedirectService
+}
+
+// NewRedirectHandler constructs a RedirectHandler.
+func NewRedirectHandler(svc RedirectService) *RedirectHandler {
+	return &RedirectHandler{svc: svc}
+}
+
+// Handle resolves the short key and issues a 302 redirect to the long URL.
+func (h *RedirectHandler) Handle(w http.ResponseWriter, r *http.Request) {
+	shortURL := chi.URLParam(r, "short_url")
+	if len(shortURL) != model.ShortKeyLength {
+		http.NotFound(w, r)
+		return
+	}
+
+	longURL, err := h.svc.Resolve(r.Context(), shortURL)
+	if err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	http.Redirect(w, r, longURL, http.StatusFound)
+}
+</file>
+
+<file path="internal/handler/router.go">
+package handler
+
+import (
+	"net/http"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/toainguyen/url-shortener/internal/config"
+)
+
+// Router builds the chi router for the given app mode. Shorten and redirect may
+// be nil when the corresponding mode is not active.
+func Router(mode config.AppMode, shorten *ShortenHandler, redirect *RedirectHandler) http.Handler {
+	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
+	r.Use(middleware.RealIP)
+	r.Use(middleware.Recoverer)
+	r.Use(middleware.Timeout(15 * time.Second))
+
+	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	if (mode == config.ModeShortener || mode == config.ModeAll) && shorten != nil {
+		r.Post("/api/v1/shorten", shorten.Handle)
+	}
+
+	if (mode == config.ModeRedirector || mode == config.ModeAll) && redirect != nil {
+		r.Get("/{short_url}", redirect.Handle)
+	}
+
+	return r
+}
+</file>
+
+<file path="internal/handler/shorten.go">
+package handler
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/url"
+	"strings"
+
+	"github.com/toainguyen/url-shortener/internal/model"
+	"github.com/toainguyen/url-shortener/internal/service"
+)
+
+// ShortenHandler serves POST /api/v1/shorten.
+type ShortenHandler struct {
+	svc ShortenService
+}
+
+// NewShortenHandler constructs a ShortenHandler.
+func NewShortenHandler(svc ShortenService) *ShortenHandler {
+	return &ShortenHandler{svc: svc}
+}
+
+// Handle decodes the request, creates the mapping, and returns 201 with metadata.
+func (h *ShortenHandler) Handle(w http.ResponseWriter, r *http.Request) {
+	var req model.ShortenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	if !validURL(req.LongURL) {
+		writeError(w, http.StatusBadRequest, "long_url must be a valid absolute http(s) URL")
+		return
+	}
+
+	doc, err := h.svc.Create(r.Context(), req.LongURL)
+	if err != nil {
+		if errors.Is(err, service.ErrAliasExhausted) {
+			writeError(w, http.StatusInternalServerError, "could not generate a unique alias")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, model.ShortenResponse{
+		ShortURL: doc.ShortURL,
+		LongURL:  doc.LongURL,
+		ExpireAt: doc.ExpireAt,
+	})
+}
+
+// validURL performs basic sanity checking on a candidate destination.
+func validURL(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	u, err := url.ParseRequestURI(raw)
+	if err != nil {
+		return false
+	}
+	return (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
+}
+</file>
+
+<file path="internal/model/url.go">
+// Package model defines the persistence and transport types for the service.
+package model
+
+import (
+	"time"
+
+	"go.mongodb.org/mongo-driver/bson/primitive"
+)
+
+// ShortKeyLength is the fixed length of every generated short key.
+const ShortKeyLength = 7
+
+// CollectionName is the MongoDB collection that stores URL mappings.
+const CollectionName = "urls"
+
+// URL is the BSON document persisted in MongoDB.
+type URL struct {
+	ID        primitive.ObjectID `bson:"_id,omitempty" json:"-"`
+	ShortURL  string             `bson:"short_url" json:"short_url"`
+	LongURL   string             `bson:"long_url" json:"long_url"`
+	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
+	ExpireAt  time.Time          `bson:"expire_at" json:"expire_at"`
+}
+
+// ShortenRequest is the JSON payload for POST /api/v1/shorten.
+type ShortenRequest struct {
+	LongURL string `json:"long_url"`
+}
+
+// ShortenResponse is returned (201) after a short URL is created.
+type ShortenResponse struct {
+	ShortURL string    `json:"short_url"`
+	LongURL  string    `json:"long_url"`
+	ExpireAt time.Time `json:"expire_at"`
+}
+</file>
+
+<file path="internal/service/mocks_test.go">
+package service
+
+import (
+	"context"
+	"time"
+
+	"github.com/toainguyen/url-shortener/internal/model"
+	"github.com/toainguyen/url-shortener/internal/store"
+)
+
+// fakeRepo is a configurable in-memory Repository for tests.
+type fakeRepo struct {
+	// findResults is consumed one entry per FindByShortURL call. Each entry is
+	// either a doc or an error (e.g. store.ErrNotFound).
+	findResults []findResult
+	findCalls   int
+
+	inserted  []*model.URL
+	insertErr error
+}
+
+type findResult struct {
+	doc *model.URL
+	err error
+}
+
+func (f *fakeRepo) FindByShortURL(_ context.Context, _ string) (*model.URL, error) {
+	idx := f.findCalls
+	f.findCalls++
+	if idx < len(f.findResults) {
+		r := f.findResults[idx]
+		return r.doc, r.err
+	}
+	// Default: not found.
+	return nil, store.ErrNotFound
+}
+
+func (f *fakeRepo) Insert(_ context.Context, u *model.URL) error {
+	if f.insertErr != nil {
+		return f.insertErr
+	}
+	f.inserted = append(f.inserted, u)
+	return nil
+}
+
+// fakeCache is a configurable Cache for tests.
+type fakeCache struct {
+	getValue string
+	getErr   error
+
+	setExCalls int
+	lastKey    string
+	lastValue  string
+	lastTTL    time.Duration
+	setExErr   error
+}
+
+func (c *fakeCache) Get(_ context.Context, _ string) (string, error) {
+	if c.getErr != nil {
+		return "", c.getErr
+	}
+	return c.getValue, nil
+}
+
+func (c *fakeCache) SetEx(_ context.Context, key, value string, ttl time.Duration) error {
+	c.setExCalls++
+	c.lastKey, c.lastValue, c.lastTTL = key, value, ttl
+	return c.setExErr
+}
+
+// fakeBloom returns a fixed Test result and records Add calls.
+type fakeBloom struct {
+	testResult bool
+	added      []string
+}
+
+func (b *fakeBloom) Add(key string)     { b.added = append(b.added, key) }
+func (b *fakeBloom) Test(_ string) bool { return b.testResult }
+</file>
+
+<file path="internal/service/redirector_test.go">
+package service
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/toainguyen/url-shortener/internal/model"
+	"github.com/toainguyen/url-shortener/internal/store"
+)
+
+func newRedirectorAt(repo Repository, cache Cache, now time.Time) *Redirector {
+	r := NewRedirector(repo, cache)
+	r.now = func() time.Time { return now }
+	return r
+}
+
+func TestRedirector_Resolve_CacheHit(t *testing.T) {
+	repo := &fakeRepo{}
+	cache := &fakeCache{getValue: "https://example.com/cached"}
+
+	r := NewRedirector(repo, cache)
+	got, err := r.Resolve(context.Background(), "abc1234")
+	if err != nil {
+		t.Fatalf("Resolve error: %v", err)
+	}
+	if got != "https://example.com/cached" {
+		t.Errorf("got %q, want cached value", got)
+	}
+	if repo.findCalls != 0 {
+		t.Errorf("expected no DB lookup on cache hit, got %d", repo.findCalls)
+	}
+}
+
+func TestRedirector_Resolve_CacheMiss_DBHit_RepopulatesCache(t *testing.T) {
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	expireAt := now.Add(48 * time.Hour)
+	repo := &fakeRepo{findResults: []findResult{{doc: &model.URL{
+		ShortURL: "abc1234",
+		LongURL:  "https://example.com/db",
+		ExpireAt: expireAt,
+	}}}}
+	cache := &fakeCache{getErr: store.ErrCacheMiss}
+
+	r := newRedirectorAt(repo, cache, now)
+	got, err := r.Resolve(context.Background(), "abc1234")
+	if err != nil {
+		t.Fatalf("Resolve error: %v", err)
+	}
+	if got != "https://example.com/db" {
+		t.Errorf("got %q, want DB value", got)
+	}
+	if cache.setExCalls != 1 {
+		t.Fatalf("expected cache repopulation, got %d SetEx calls", cache.setExCalls)
+	}
+	if cache.lastTTL != 48*time.Hour {
+		t.Errorf("repopulated TTL = %v, want remaining 48h", cache.lastTTL)
+	}
+}
+
+func TestRedirector_Resolve_ExpiredDocument_NotFound(t *testing.T) {
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	repo := &fakeRepo{findResults: []findResult{{doc: &model.URL{
+		ShortURL: "abc1234",
+		LongURL:  "https://example.com/old",
+		ExpireAt: now.Add(-1 * time.Hour), // already expired
+	}}}}
+	cache := &fakeCache{getErr: store.ErrCacheMiss}
+
+	r := newRedirectorAt(repo, cache, now)
+	_, err := r.Resolve(context.Background(), "abc1234")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for expired doc, got %v", err)
+	}
+	if cache.setExCalls != 0 {
+		t.Errorf("expected no cache write for expired doc, got %d", cache.setExCalls)
+	}
+}
+
+func TestRedirector_Resolve_MissingDocument_NotFound(t *testing.T) {
+	repo := &fakeRepo{findResults: []findResult{{err: store.ErrNotFound}}}
+	cache := &fakeCache{getErr: store.ErrCacheMiss}
+
+	r := NewRedirector(repo, cache)
+	_, err := r.Resolve(context.Background(), "missing")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+</file>
+
+<file path="internal/service/redirector.go">
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/toainguyen/url-shortener/internal/store"
+)
+
+// Redirector implements the read path with a cache-aside strategy backed by an
+// explicit expiry guard.
+type Redirector struct {
+	repo  Repository
+	cache Cache
+	now   func() time.Time // injectable clock for deterministic tests
+}
+
+// NewRedirector constructs a Redirector.
+func NewRedirector(repo Repository, cache Cache) *Redirector {
+	return &Redirector{repo: repo, cache: cache, now: time.Now}
+}
+
+// Resolve returns the long URL for shortURL. It checks Redis first; on a miss it
+// queries MongoDB, validates expiry (guarding against TTL-cleanup lag), lazily
+// repopulates the cache with the remaining TTL, and returns the destination.
+// Returns ErrNotFound when the mapping is absent or expired.
+func (r *Redirector) Resolve(ctx context.Context, shortURL string) (string, error) {
+	// Fast path: cache hit.
+	longURL, err := r.cache.Get(ctx, shortURL)
+	if err == nil {
+		return longURL, nil
+	}
+	if !errors.Is(err, store.ErrCacheMiss) {
+		return "", fmt.Errorf("redirector: cache get: %w", err)
+	}
+
+	// Cache miss: consult MongoDB.
+	doc, err := r.repo.FindByShortURL(ctx, shortURL)
+	if errors.Is(err, store.ErrNotFound) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("redirector: lookup: %w", err)
+	}
+
+	// Explicit expiry check: MongoDB's TTL sweep is asynchronous and may lag.
+	remaining := doc.ExpireAt.Sub(r.now())
+	if remaining <= 0 {
+		return "", ErrNotFound
+	}
+
+	// Lazily repopulate the cache for the remaining lifetime. Non-fatal on error.
+	if err := r.cache.SetEx(ctx, shortURL, doc.LongURL, remaining); err != nil {
+		_ = err
+	}
+
+	return doc.LongURL, nil
+}
+</file>
+
+<file path="internal/service/service.go">
+// Package service holds the core business logic for the write and read paths.
+package service
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/toainguyen/url-shortener/internal/model"
+)
+
+// ErrNotFound indicates the short URL does not exist (or has expired).
+var ErrNotFound = errors.New("short url not found")
+
+// ErrAliasExhausted indicates a unique short key could not be generated within
+// the retry budget. Mapped to HTTP 500 by handlers.
+var ErrAliasExhausted = errors.New("could not generate a unique alias")
+
+// maxRetries bounds the collision-resolution loop in the shortener.
+const maxRetries = 10
+
+// secondsPerDay is used to translate the TTL-in-days config into a duration.
+const secondsPerDay = 24 * 60 * 60
+
+// Repository is the persistence contract required by the services. It is
+// satisfied by store.MongoRepository and mocked in tests. Implementations must
+// return store.ErrNotFound (wrapped) from FindByShortURL when absent; callers
+// detect absence via errors.Is against the package-level sentinel they expect.
+type Repository interface {
+	FindByShortURL(ctx context.Context, shortURL string) (*model.URL, error)
+	Insert(ctx context.Context, u *model.URL) error
+}
+
+// Cache is the caching contract; satisfied by store.RedisCache. SetEx with a
+// non-positive TTL is treated as a no-op. Get returns a miss error that callers
+// detect via the concrete store.ErrCacheMiss sentinel.
+type Cache interface {
+	Get(ctx context.Context, key string) (string, error)
+	SetEx(ctx context.Context, key, value string, ttl time.Duration) error
+}
+
+// BloomFilter is the probabilistic membership contract; satisfied by
+// util.BloomFilter.
+type BloomFilter interface {
+	Add(key string)
+	Test(key string) bool
+}
+</file>
+
+<file path="internal/service/shortener_test.go">
+package service
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/toainguyen/url-shortener/internal/model"
+	"github.com/toainguyen/url-shortener/internal/store"
+)
+
+const ttlDays = 30
+
+func TestShortener_Create_BloomMiss_FastPath(t *testing.T) {
+	repo := &fakeRepo{}
+	cache := &fakeCache{}
+	bloom := &fakeBloom{testResult: false} // guaranteed-not-found -> no DB probe
+
+	s := NewShortener(repo, cache, bloom, ttlDays)
+	doc, err := s.Create(context.Background(), "https://example.com")
+	if err != nil {
+		t.Fatalf("Create returned error: %v", err)
+	}
+
+	if repo.findCalls != 0 {
+		t.Errorf("expected no DB probe on bloom miss, got %d FindByShortURL calls", repo.findCalls)
+	}
+	if len(doc.ShortURL) != model.ShortKeyLength {
+		t.Errorf("short key length = %d, want %d", len(doc.ShortURL), model.ShortKeyLength)
+	}
+	if len(repo.inserted) != 1 {
+		t.Fatalf("expected 1 inserted doc, got %d", len(repo.inserted))
+	}
+	if cache.setExCalls != 1 {
+		t.Errorf("expected cache SetEx called once, got %d", cache.setExCalls)
+	}
+	wantTTL := time.Duration(ttlDays) * 24 * time.Hour
+	if cache.lastTTL != wantTTL {
+		t.Errorf("cache TTL = %v, want %v", cache.lastTTL, wantTTL)
+	}
+	if len(bloom.added) != 1 || bloom.added[0] != doc.ShortURL {
+		t.Errorf("expected bloom updated with %q, got %v", doc.ShortURL, bloom.added)
+	}
+}
+
+func TestShortener_Create_BloomFalsePositive_DBConfirmsFree(t *testing.T) {
+	repo := &fakeRepo{findResults: []findResult{{err: store.ErrNotFound}}}
+	cache := &fakeCache{}
+	bloom := &fakeBloom{testResult: true} // forces DB confirmation
+
+	s := NewShortener(repo, cache, bloom, ttlDays)
+	doc, err := s.Create(context.Background(), "https://example.com")
+	if err != nil {
+		t.Fatalf("Create returned error: %v", err)
+	}
+	if repo.findCalls != 1 {
+		t.Errorf("expected exactly 1 DB probe, got %d", repo.findCalls)
+	}
+	if len(repo.inserted) != 1 || repo.inserted[0].ShortURL != doc.ShortURL {
+		t.Errorf("expected doc inserted with key %q", doc.ShortURL)
+	}
+}
+
+func TestShortener_Create_CollisionRetry_ThenSucceeds(t *testing.T) {
+	// First probe finds an existing doc (collision); second probe is free.
+	repo := &fakeRepo{findResults: []findResult{
+		{doc: &model.URL{ShortURL: "AAAAAAA"}}, // collision on attempt 0
+		{err: store.ErrNotFound},               // free on attempt 1 (salted)
+	}}
+	cache := &fakeCache{}
+	bloom := &fakeBloom{testResult: true}
+
+	s := NewShortener(repo, cache, bloom, ttlDays)
+	doc, err := s.Create(context.Background(), "https://example.com")
+	if err != nil {
+		t.Fatalf("Create returned error: %v", err)
+	}
+	if repo.findCalls != 2 {
+		t.Errorf("expected 2 DB probes (retry), got %d", repo.findCalls)
+	}
+	if len(repo.inserted) != 1 {
+		t.Fatalf("expected 1 inserted doc after retry, got %d", len(repo.inserted))
+	}
+	if doc.ShortURL == "" {
+		t.Error("expected a non-empty short key")
+	}
+}
+
+func TestShortener_Create_ExhaustsRetries_Returns500Error(t *testing.T) {
+	// Every probe reports an existing collision -> loop exhausts after maxRetries.
+	results := make([]findResult, maxRetries)
+	for i := range results {
+		results[i] = findResult{doc: &model.URL{ShortURL: "COLLIDE"}}
+	}
+	repo := &fakeRepo{findResults: results}
+	cache := &fakeCache{}
+	bloom := &fakeBloom{testResult: true}
+
+	s := NewShortener(repo, cache, bloom, ttlDays)
+	_, err := s.Create(context.Background(), "https://example.com")
+	if !errors.Is(err, ErrAliasExhausted) {
+		t.Fatalf("expected ErrAliasExhausted, got %v", err)
+	}
+	if repo.findCalls != maxRetries {
+		t.Errorf("expected %d DB probes, got %d", maxRetries, repo.findCalls)
+	}
+	if len(repo.inserted) != 0 {
+		t.Errorf("expected no insert on exhaustion, got %d", len(repo.inserted))
+	}
+}
+
+func TestShortener_Create_AppliesTTLExpiry(t *testing.T) {
+	repo := &fakeRepo{}
+	cache := &fakeCache{}
+	bloom := &fakeBloom{testResult: false}
+
+	fixed := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	s := NewShortener(repo, cache, bloom, ttlDays)
+	s.now = func() time.Time { return fixed }
+
+	doc, err := s.Create(context.Background(), "https://example.com")
+	if err != nil {
+		t.Fatalf("Create returned error: %v", err)
+	}
+	want := fixed.AddDate(0, 0, ttlDays)
+	if !doc.ExpireAt.Equal(want) {
+		t.Errorf("ExpireAt = %v, want %v", doc.ExpireAt, want)
+	}
+}
+</file>
+
+<file path="internal/service/shortener.go">
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
+	"time"
+
+	"github.com/toainguyen/url-shortener/internal/model"
+	"github.com/toainguyen/url-shortener/internal/store"
+	"github.com/toainguyen/url-shortener/internal/util"
+)
+
+// Shortener implements the write path: generate a unique short key and persist
+// the mapping across MongoDB, Redis, and the in-memory Bloom filter.
+type Shortener struct {
+	repo    Repository
+	cache   Cache
+	bloom   BloomFilter
+	ttlDays int
+	now     func() time.Time // injectable clock for deterministic tests
+}
+
+// NewShortener constructs a Shortener.
+func NewShortener(repo Repository, cache Cache, bloom BloomFilter, ttlDays int) *Shortener {
+	return &Shortener{
+		repo:    repo,
+		cache:   cache,
+		bloom:   bloom,
+		ttlDays: ttlDays,
+		now:     time.Now,
+	}
+}
+
+// Create generates a unique 7-character short key for longURL, persists the
+// mapping, seeds the cache, and updates the Bloom filter. It follows the
+// specified collision-resolution sequence: hash the URL, probe the Bloom filter,
+// and only consult MongoDB on a potential collision.
+func (s *Shortener) Create(ctx context.Context, longURL string) (*model.URL, error) {
+	expireAt := s.now().AddDate(0, 0, s.ttlDays)
+
+	shortKey, err := s.generateUniqueKey(ctx, longURL)
+	if err != nil {
+		return nil, err
+	}
+
+	doc := &model.URL{
+		ShortURL:  shortKey,
+		LongURL:   longURL,
+		CreatedAt: s.now(),
+		ExpireAt:  expireAt,
+	}
+	if err := s.repo.Insert(ctx, doc); err != nil {
+		return nil, fmt.Errorf("shortener: persist: %w", err)
+	}
+
+	// Seed the cache with the full configured TTL. A cache failure must not fail
+	// the write — the redirector can lazily repopulate from MongoDB.
+	ttl := time.Duration(s.ttlDays) * secondsPerDay * time.Second
+	if err := s.cache.SetEx(ctx, shortKey, longURL, ttl); err != nil {
+		// Non-fatal: log-and-continue semantics are left to the caller's logger.
+		_ = err
+	}
+
+	s.bloom.Add(shortKey)
+	return doc, nil
+}
+
+// generateUniqueKey runs the bounded retry loop described in the spec.
+func (s *Shortener) generateUniqueKey(ctx context.Context, longURL string) (string, error) {
+	for retryCount := 0; retryCount < maxRetries; retryCount++ {
+		seed := longURL
+		if retryCount > 0 {
+			// Salt with a high-resolution timestamp to break the deterministic
+			// collision on subsequent attempts.
+			seed = longURL + strconv.FormatInt(s.now().UnixNano(), 10)
+		}
+		shortKey := util.Base62Key(util.MD5(seed), model.ShortKeyLength)
+
+		// Bloom filter says "definitely not present" -> the key is free.
+		if !s.bloom.Test(shortKey) {
+			return shortKey, nil
+		}
+
+		// Potential collision: confirm against the database.
+		_, err := s.repo.FindByShortURL(ctx, shortKey)
+		if errors.Is(err, store.ErrNotFound) {
+			// False positive — the key is actually free.
+			return shortKey, nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("shortener: collision check: %w", err)
+		}
+		// A record exists; retry with a fresh salt.
+	}
+
+	return "", ErrAliasExhausted
+}
+</file>
+
+<file path="internal/store/mongo.go">
+// Package store wires the MongoDB and Redis clients used by the services.
+package store
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/toainguyen/url-shortener/internal/model"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+)
+
+// NewMongo connects to MongoDB and verifies the connection with a ping.
+func NewMongo(ctx context.Context, uri string) (*mongo.Client, error) {
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
+	if err != nil {
+		return nil, fmt.Errorf("mongo connect: %w", err)
+	}
+	if err := client.Ping(ctx, nil); err != nil {
+		return nil, fmt.Errorf("mongo ping: %w", err)
+	}
+	return client, nil
+}
+
+// URLCollection returns the handle to the urls collection.
+func URLCollection(client *mongo.Client, dbName string) *mongo.Collection {
+	return client.Database(dbName).Collection(model.CollectionName)
+}
+
+// EnsureIndexes creates the unique index on short_url and the TTL index on
+// expire_at. It is idempotent and safe to call on every startup.
+func EnsureIndexes(ctx context.Context, coll *mongo.Collection) error {
+	models := []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "short_url", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("uniq_short_url"),
+		},
+		{
+			// MongoDB removes the document once expire_at is in the past.
+			Keys:    bson.D{{Key: "expire_at", Value: 1}},
+			Options: options.Index().SetExpireAfterSeconds(0).SetName("ttl_expire_at"),
+		},
+	}
+
+	if _, err := coll.Indexes().CreateMany(ctx, models); err != nil {
+		return fmt.Errorf("create indexes: %w", err)
+	}
+	return nil
+}
+
+// DisconnectTimeout bounds graceful client shutdown.
+const DisconnectTimeout = 5 * time.Second
+</file>
+
+<file path="internal/store/redis.go">
+package store
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+// ErrCacheMiss is returned by Cache.Get when the key is absent.
+var ErrCacheMiss = errors.New("cache miss")
+
+// Cache abstracts the Redis operations the services depend on, enabling mocking
+// in unit tests.
+type Cache interface {
+	Get(ctx context.Context, key string) (string, error)
+	SetEx(ctx context.Context, key, value string, ttl time.Duration) error
+}
+
+// RedisCache is the production Cache backed by go-redis.
+type RedisCache struct {
+	client *redis.Client
+}
+
+// NewRedis connects to Redis and verifies the connection with a ping.
+func NewRedis(ctx context.Context, addr, password string, db int) (*RedisCache, error) {
+	client := redis.NewClient(&redis.Options{
+		Addr:     addr,
+		Password: password,
+		DB:       db,
+	})
+	if err := client.Ping(ctx).Err(); err != nil {
+		return nil, fmt.Errorf("redis ping: %w", err)
+	}
+	return &RedisCache{client: client}, nil
+}
+
+// Get returns the value for key, or ErrCacheMiss if it does not exist.
+func (c *RedisCache) Get(ctx context.Context, key string) (string, error) {
+	val, err := c.client.Get(ctx, key).Result()
+	if errors.Is(err, redis.Nil) {
+		return "", ErrCacheMiss
+	}
+	if err != nil {
+		return "", fmt.Errorf("redis get: %w", err)
+	}
+	return val, nil
+}
+
+// SetEx stores key=value with the given TTL. A non-positive TTL is ignored to
+// avoid writing a key that Redis would treat as "no expiry".
+func (c *RedisCache) SetEx(ctx context.Context, key, value string, ttl time.Duration) error {
+	if ttl <= 0 {
+		return nil
+	}
+	if err := c.client.Set(ctx, key, value, ttl).Err(); err != nil {
+		return fmt.Errorf("redis setex: %w", err)
+	}
+	return nil
+}
+
+// Close releases the underlying connection pool.
+func (c *RedisCache) Close() error {
+	return c.client.Close()
+}
+</file>
+
+<file path="internal/store/repository.go">
+package store
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/toainguyen/url-shortener/internal/model"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+)
+
+// ErrNotFound is returned by the repository when no document matches.
+var ErrNotFound = errors.New("url not found")
+
+// MongoRepository is the MongoDB-backed persistence layer for URL documents.
+type MongoRepository struct {
+	coll *mongo.Collection
+}
+
+// NewMongoRepository wraps a urls collection.
+func NewMongoRepository(coll *mongo.Collection) *MongoRepository {
+	return &MongoRepository{coll: coll}
+}
+
+// FindByShortURL returns the document for shortURL, or ErrNotFound.
+func (r *MongoRepository) FindByShortURL(ctx context.Context, shortURL string) (*model.URL, error) {
+	var doc model.URL
+	err := r.coll.FindOne(ctx, bson.M{"short_url": shortURL}).Decode(&doc)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find by short_url: %w", err)
+	}
+	return &doc, nil
+}
+
+// Insert persists a new URL document.
+func (r *MongoRepository) Insert(ctx context.Context, u *model.URL) error {
+	if _, err := r.coll.InsertOne(ctx, u); err != nil {
+		return fmt.Errorf("insert url: %w", err)
+	}
+	return nil
+}
+</file>
+
+<file path="internal/util/base62_test.go">
+package util
+
+import (
+	"strings"
+	"testing"
+)
+
+// keyLen mirrors model.ShortKeyLength; duplicated here to keep util dependency-free.
+const keyLen = 7
+
+func TestBase62Encode_Deterministic(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []byte
+		want string
+	}{
+		{"empty", []byte{}, "0"},
+		{"zero byte", []byte{0x00}, "0"},
+		{"one", []byte{0x01}, "1"},
+		{"sixty-one", []byte{61}, "z"},
+		{"sixty-two", []byte{62}, "10"},
+		{"two fifty-five", []byte{0xFF}, "47"}, // 255 = 4*62 + 7
+		{"256", []byte{0x01, 0x00}, "48"},      // 256 = 4*62 + 8
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Base62Encode(tt.in); got != tt.want {
+				t.Fatalf("Base62Encode(%v) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBase62Encode_StableAcrossCalls(t *testing.T) {
+	in := MD5("https://example.com/a/very/long/path?with=query")
+	first := Base62Encode(in)
+	for i := 0; i < 100; i++ {
+		if got := Base62Encode(in); got != first {
+			t.Fatalf("encode not deterministic: call %d gave %q, want %q", i, got, first)
+		}
+	}
+}
+
+func TestBase62Encode_AlphabetOnly(t *testing.T) {
+	in := MD5("alphabet-check")
+	got := Base62Encode(in)
+	for _, c := range got {
+		if !strings.ContainsRune(base62Alphabet, c) {
+			t.Fatalf("output contains non-base62 rune %q", c)
+		}
+	}
+}
+
+func TestBase62Key_FixedLength(t *testing.T) {
+	// MD5 of an arbitrary string yields a large integer -> >7 base62 chars,
+	// exercising the truncation branch.
+	long := Base62Key(MD5("collision-seed"), keyLen)
+	if len(long) != keyLen {
+		t.Fatalf("len(long key) = %d, want %d", len(long), keyLen)
+	}
+
+	// A tiny input exercises the left-padding branch.
+	padded := Base62Key([]byte{0x01}, keyLen)
+	if len(padded) != keyLen {
+		t.Fatalf("len(padded key) = %d, want %d", len(padded), keyLen)
+	}
+	if !strings.HasSuffix(padded, "1") || strings.Trim(padded, "0") != "1" {
+		t.Fatalf("padded key = %q, want zero-padded %q", padded, "0000001")
+	}
+}
+
+func TestBase62Key_Deterministic(t *testing.T) {
+	seed := MD5("same-input")
+	a := Base62Key(seed, keyLen)
+	b := Base62Key(seed, keyLen)
+	if a != b {
+		t.Fatalf("Base62Key not deterministic: %q vs %q", a, b)
+	}
+}
+</file>
+
+<file path="internal/util/base62.go">
+package util
+
+import (
+	"math/big"
+	"strings"
+)
+
+// base62Alphabet is the ordered symbol set: digits, then upper, then lower case.
+const base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+var base62Base = big.NewInt(62)
+
+// Base62Encode interprets b as a big-endian unsigned integer and renders it in
+// base62. The result is deterministic for a given input. An all-zero or empty
+// input encodes to "0".
+func Base62Encode(b []byte) string {
+	n := new(big.Int).SetBytes(b)
+	if n.Sign() == 0 {
+		return string(base62Alphabet[0])
+	}
+
+	var sb strings.Builder
+	mod := new(big.Int)
+	zero := big.NewInt(0)
+	for n.Cmp(zero) > 0 {
+		n.DivMod(n, base62Base, mod)
+		sb.WriteByte(base62Alphabet[mod.Int64()])
+	}
+
+	// DivMod yields least-significant digit first; reverse for big-endian order.
+	return reverse(sb.String())
+}
+
+// reverse returns s with its bytes in reverse order. base62 output is ASCII, so
+// byte-level reversal is safe.
+func reverse(s string) string {
+	r := []byte(s)
+	for i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {
+		r[i], r[j] = r[j], r[i]
+	}
+	return string(r)
+}
+
+// Base62Key encodes b and returns a fixed-length key of exactly length chars.
+// Shorter encodings are left-padded with the zero symbol; longer encodings are
+// truncated to the leading length characters.
+func Base62Key(b []byte, length int) string {
+	enc := Base62Encode(b)
+	if len(enc) >= length {
+		return enc[:length]
+	}
+	return strings.Repeat(string(base62Alphabet[0]), length-len(enc)) + enc
+}
+</file>
+
+<file path="internal/util/bloom.go">
+package util
+
+import (
+	"context"
+	"fmt"
+	"sync"
+
+	"github.com/bits-and-blooms/bloom/v3"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+)
+
+// BloomFilter is a concurrency-safe wrapper around a probabilistic set used to
+// cheaply reject short keys that are guaranteed not to exist, avoiding a DB
+// round-trip on the common path. Test may return false positives (never false
+// negatives), so callers must confirm a positive against the database.
+type BloomFilter struct {
+	mu     sync.RWMutex
+	filter *bloom.BloomFilter
+}
+
+// NewBloomFilter builds a filter sized for the expected capacity and target
+// false-positive rate.
+func NewBloomFilter(capacity uint, fpRate float64) *BloomFilter {
+	return &BloomFilter{
+		filter: bloom.NewWithEstimates(capacity, fpRate),
+	}
+}
+
+// Add records key in the filter.
+func (b *BloomFilter) Add(key string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.filter.AddString(key)
+}
+
+// Test reports whether key may be present. A false result guarantees absence.
+func (b *BloomFilter) Test(key string) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.filter.TestString(key)
+}
+
+// Warm streams every existing short_url from the collection into the filter so a
+// freshly started instance retains collision protection for previously issued
+// keys.
+func (b *BloomFilter) Warm(ctx context.Context, coll *mongo.Collection) error {
+	opts := options.Find().SetProjection(bson.M{"short_url": 1, "_id": 0})
+	cursor, err := coll.Find(ctx, bson.M{}, opts)
+	if err != nil {
+		return fmt.Errorf("bloom warm: find: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	for cursor.Next(ctx) {
+		var doc struct {
+			ShortURL string `bson:"short_url"`
+		}
+		if err := cursor.Decode(&doc); err != nil {
+			return fmt.Errorf("bloom warm: decode: %w", err)
+		}
+		if doc.ShortURL != "" {
+			b.Add(doc.ShortURL)
+		}
+	}
+	if err := cursor.Err(); err != nil {
+		return fmt.Errorf("bloom warm: cursor: %w", err)
+	}
+	return nil
+}
+</file>
+
+<file path="internal/util/hash.go">
+package util
+
+import "crypto/md5"
+
+// MD5 returns the raw 16-byte MD5 digest of s.
+func MD5(s string) []byte {
+	sum := md5.Sum([]byte(s))
+	return sum[:]
+}
+</file>
+
+<file path="README.md">
+# url-shortener
+
+A horizontally-scalable URL shortener written in Go. The system is split into two
+independently scalable paths that ship as **one binary** selected at runtime via the
+`APP_MODE` environment variable, and run as **separate containers** from the same image:
+
+- **Shortener (write path)** — `POST /api/v1/shorten`: hashes the long URL, generates a unique
+  7-character key, persists it, and seeds the cache.
+- **Redirector (read path)** — `GET /{short_url}`: resolves the key via a cache-aside lookup and
+  issues an HTTP 302 redirect.
+
+## Stack
+
+| Concern        | Technology                                   |
+| -------------- | -------------------------------------------- |
+| Language       | Go 1.26                                       |
+| Router         | `go-chi/chi/v5`                               |
+| Storage        | MongoDB (unique index + TTL index)           |
+| Cache          | Redis (cache-aside, `SETEX`)                 |
+| Collision filter | In-memory Bloom filter (`bits-and-blooms/bloom`) |
+
+## Architecture
+
+```
+                 POST /api/v1/shorten                 GET /{short_url}
+                        │                                    │
+                 ┌──────▼───────┐                     ┌──────▼───────┐
+                 │  Shortener   │                     │  Redirector  │
+                 │  (write)     │                     │  (read)      │
+                 └──┬───┬───┬───┘                     └────┬────┬────┘
+        Bloom probe │   │   │ SETEX                   GET  │    │ SETEX (lazy)
+                    │   │   ▼                              ▼    │
+                    │   │  Redis  ◄───────────────────────┘    │
+                    │   ▼                                       │
+                    │  MongoDB (urls: unique short_url, TTL expire_at) ◄┘
+                    ▼
+              In-memory Bloom filter (warmed from Mongo on boot)
+```
+
+### Key generation (write path)
+1. `expireAt = now + DEFAULT_TTL_DAYS`.
+2. Attempt 0: `Base62(MD5(long_url))[:7]`. Retries: salt with `UnixNano` before hashing.
+3. Probe the Bloom filter: a negative is conclusive (key is free). A positive triggers a
+   confirming `FindOne` against MongoDB; if a doc exists, retry (up to 10 times, else HTTP 500).
+4. Insert the document, `SETEX` the cache for the full TTL, and add the key to the Bloom filter.
+
+### Resolution (read path)
+1. Redis hit → 302 immediately.
+2. Miss → MongoDB `FindOne`; missing → 404.
+3. Found but past `expire_at` (guards against TTL-sweep lag) → 404.
+4. Valid → lazily `SETEX` for the remaining lifetime → 302.
+
+## Project layout
+
+```
+cmd/server/        # entrypoint; reads APP_MODE, wires dependencies
+internal/config/   # environment-driven configuration
+internal/model/    # URL document + request/response DTOs
+internal/store/    # Mongo client + indexes, Redis cache, repository
+internal/service/  # Shortener and Redirector business logic
+internal/handler/  # chi handlers + per-mode router
+internal/util/     # MD5, Base62, Bloom filter helpers
+```
+
+## Running
+
+### Docker Compose (recommended)
+```bash
+cp .env.example .env   # optional: tweak DEFAULT_TTL_DAYS, bloom sizing
+docker compose up --build
+```
+This starts MongoDB, Redis, the **shortener** on `:8080`, and the **redirector** on `:8081`.
+Scale either path independently:
+```bash
+docker compose up --build --scale shortener=3 --scale redirector=5
+```
+
+### Local (single process, both paths)
+```bash
+APP_MODE=all go run ./cmd/server   # needs local MongoDB + Redis
+```
+
+## API
+
+### Create a short URL
+```bash
+curl -i -X POST localhost:8080/api/v1/shorten \
+  -H 'Content-Type: application/json' \
+  -d '{"long_url":"https://example.com/some/very/long/path"}'
+```
+```
+HTTP/1.1 201 Created
+{"short_url":"aZ3xK9b","long_url":"https://example.com/some/very/long/path","expire_at":"2026-07-15T..."}
+```
+
+### Follow a short URL
+```bash
+curl -i localhost:8081/aZ3xK9b
+```
+```
+HTTP/1.1 302 Found
+Location: https://example.com/some/very/long/path
+```
+Unknown or expired keys return `404 Not Found`.
+
+## Configuration
+
+| Variable           | Default                     | Notes                                  |
+| ------------------ | --------------------------- | -------------------------------------- |
+| `APP_MODE`         | `all`                       | `shortener` \| `redirector` \| `all`   |
+| `PORT`             | `8080`                      | HTTP listen port                       |
+| `MONGO_URI`        | `mongodb://localhost:27017` |                                        |
+| `MONGO_DB`         | `urlshortener`              |                                        |
+| `REDIS_ADDR`       | `localhost:6379`            |                                        |
+| `REDIS_PASSWORD`   | _(empty)_                   |                                        |
+| `REDIS_DB`         | `0`                         |                                        |
+| `DEFAULT_TTL_DAYS` | `30`                        | Expiry applied to every new URL        |
+| `BLOOM_CAPACITY`   | `10000000`                  | Expected key count (shortener/all)     |
+| `BLOOM_FP_RATE`    | `0.001`                     | Target false-positive rate             |
+
+## Testing
+```bash
+go test ./...
+```
+Unit tests cover the deterministic Base62 conversion, the collision retry loop (mocked Mongo /
+Redis / Bloom), and the cache-aside resolution paths (hit, miss→DB, expired, missing).
+</file>
+
+</files>
